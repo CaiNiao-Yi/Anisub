@@ -1,0 +1,93 @@
+use ffmpeg_next::{
+    codec,
+    encoder::{self, subtitle},
+    ffi::av_packet_unref,
+    format, media, Rational,
+};
+
+fn main() {
+    let video_path = String::from(
+        "./[BeanSub&VCB-Studio] Tanaka-kun wa Itsumo Kedaruge [01][Ma10p_1080p][x265_flac_aac].mkv",
+    );
+    let subtitle_path=String::from("./[BeanSub&VCB-Studio] Tanaka-kun wa Itsumo Kedaruge [01][Ma10p_1080p][x265_flac_aac].sc.ass");
+    let output_path = String::from(
+        "./[BeanSub&VCB-Studio] Tanaka-kun wa Itsumo Kedaruge [01][Ma10p_1080p][x265_flac_aac][chs].mkv",
+    );
+    ffmpeg_next::init().unwrap();
+    let mut video_ctx = format::input(&video_path).unwrap();
+    let mut subtitle_ctx = format::input(&subtitle_path).unwrap();
+    let mut output_ctx = format::output(&output_path).unwrap();
+
+    let mut stream_mapping = vec![0 as i32; (video_ctx.nb_streams()) as _];
+    let mut ist_time_base = vec![Rational(0, 1); (video_ctx.nb_streams()) as _];
+    let mut ost_index = 0;
+    for (ist_index, ist) in video_ctx.streams().enumerate() {
+        let ist_medium = ist.parameters().medium();
+        if ist_medium != media::Type::Audio
+            && ist_medium != media::Type::Video
+            && ist_medium != media::Type::Subtitle
+        {
+            stream_mapping[ist_index] = -1;
+            continue;
+        }
+        stream_mapping[ist_index] = ost_index;
+        ist_time_base[ist_index] = ist.time_base();
+        ost_index += 1;
+        let mut ost = output_ctx
+            .add_stream(encoder::find(codec::Id::None))
+            .unwrap();
+        ost.set_parameters(ist.parameters());
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+    }
+    {
+        let ist = subtitle_ctx
+            .stream((subtitle_ctx.nb_streams() - 1) as _)
+            .unwrap();
+        let mut ost = output_ctx
+            .add_stream(encoder::find(codec::Id::None))
+            .unwrap();
+        ost.set_parameters(ist.parameters());
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+    }
+    for (i, c) in video_ctx.chapters().enumerate() {
+        output_ctx
+            .add_chapter(
+                c.id(),
+                c.time_base(),
+                c.start(),
+                c.end(),
+                format!("Chapter {}", i + 1),
+            )
+            .unwrap();
+    }
+    output_ctx.set_metadata(video_ctx.metadata().to_owned());
+    output_ctx.write_header().unwrap();
+
+    for (stream, mut packet) in video_ctx.packets() {
+        let ist_index = stream.index();
+        let ost_index = stream_mapping[ist_index];
+        if ost_index < 0 {
+            continue;
+        }
+        let ost = output_ctx.stream(ost_index as _).unwrap();
+        packet.rescale_ts(ist_time_base[ist_index], ost.time_base());
+        packet.set_position(-1);
+        packet.set_stream(ost_index as _);
+        packet.write_interleaved(&mut output_ctx).unwrap();
+    }
+    println!("视频完成");
+    for (stream, mut packet) in subtitle_ctx.packets() {
+        let ost = output_ctx.stream((ost_index) as _).unwrap();
+        packet.rescale_ts(stream.time_base(), ost.time_base());
+        packet.set_position(-1);
+        packet.set_stream(ost_index as _);
+        packet.write_interleaved(&mut output_ctx).unwrap();
+    }
+    println!("字幕完成");
+
+    output_ctx.write_trailer().unwrap();
+}
